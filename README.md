@@ -13,6 +13,15 @@ A lightweight desktop application that instantly translates selected text betwee
 
 ## Quick Start
 
+### Option 1: Quick Run (Windows)
+1. Download `lingosnap.exe`
+2. Create a `.env` file in the same directory and add your Gemini API key:
+```bash
+GEMINI_API_KEY=your-api-key-here
+```
+3. Double-click `lingosnap.exe` to run
+
+### Option 2: Build from Source
 1. Get your Gemini API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
 
 2. Clone and set up:
