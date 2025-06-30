@@ -1,190 +1,135 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/atotto/clipboard"
-	"github.com/getlantern/systray"
 	"github.com/go-vgo/robotgo"
 	"github.com/joho/godotenv"
 	hook "github.com/robotn/gohook"
-)
-
-// API configuration
-const (
-	modelName         = "gemini-2.0-flash"
-	translateEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent"
-)
-
-// API request/response structures
-type (
-	request struct {
-		Contents []content `json:"contents"`
-	}
-
-	content struct {
-		Parts []part `json:"parts"`
-	}
-
-	part struct {
-		Text string `json:"text"`
-	}
-
-	response struct {
-		Candidates []struct {
-			Content content `json:"content"`
-		} `json:"candidates"`
-	}
+	"google.golang.org/genai"
 )
 
 func main() {
-	// Load API key from .env or environment
+	// Load environment variables
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found, using environment variables")
 	}
-
-	apiKey := os.Getenv("GEMINI_API_KEY")
-	if apiKey == "" {
-		log.Fatal("GEMINI_API_KEY environment variable not set")
+	
+	if os.Getenv("GEMINI_API_KEY") == "" {
+		log.Fatal("GEMINI_API_KEY environment variable is required")
 	}
 
-	log.Println("Starting Text Translator")
-	log.Println("Usage: Select text, then press and release Right Shift to translate")
+	log.Println("✅ Text Translator is running...")
+	log.Println("   Usage: Select text, then press and release Right Shift")
+	log.Println("   The text will be automatically translated and pasted")
+	if runtime.GOOS == "darwin" {
+		log.Println("   Note: On macOS, you may need to grant accessibility permissions")
+	}
+	log.Println("   Press Ctrl+C to exit")
 
-	// Set up systray
-	go systray.Run(onReady, onExit)
-
-	// Set up keyboard hook
+	// Register Right Shift key release event
 	hook.Register(hook.KeyUp, []string{"rshift"}, func(e hook.Event) {
-		log.Println("Right Shift released - translating selected text")
-		go func() {
-			if err := processSelectedText(apiKey); err != nil {
-				log.Printf("Translation error: %v", err)
-			}
-		}()
+		log.Println("▶ Right Shift detected - processing selected text...")
+		go processSelectedText()
 	})
 
-	// Start event listener (blocks until terminated)
 	s := hook.Start()
 	<-hook.Process(s)
 }
 
-func onReady() {
-	systray.SetTitle("Text Translator")
-	systray.SetTooltip("Select text + Right Shift to translate")
-
-	mQuit := systray.AddMenuItem("Quit", "Exit the application")
-	go func() {
-		<-mQuit.ClickedCh
-		systray.Quit()
-	}()
-}
-
-func onExit() {
-	// Cleanup resources if needed
-}
-
-func processSelectedText(apiKey string) error {
+func processSelectedText() {
 	// Copy selected text to clipboard
-	robotgo.KeyTap("c", "ctrl")
+	copyToClipboard()
 	time.Sleep(200 * time.Millisecond)
 
-	// Get text from clipboard
-	text, err := clipboard.ReadAll()
+	originalText, err := clipboard.ReadAll()
 	if err != nil {
-		return fmt.Errorf("failed to read clipboard: %w", err)
+		log.Printf("❌ Failed to read clipboard: %v", err)
+		return
 	}
 
-	if text == "" {
-		return fmt.Errorf("no text selected")
+	if strings.TrimSpace(originalText) == "" {
+		log.Println("⚠️  No text selected")
+		return
 	}
 
-	log.Printf("Selected text: %s", truncate(text, 50))
+	log.Printf("   Original: %s", truncateText(originalText, 50))
 
-	// Translate the text
-	translated, err := translateText(context.Background(), apiKey, text)
+	correctedText, err := translateWithGemini(originalText)
 	if err != nil {
-		return err
+		log.Printf("❌ Translation failed: %v", err)
+		return
 	}
 
-	// Write translation to clipboard
-	if err := clipboard.WriteAll(translated); err != nil {
-		return fmt.Errorf("failed to write to clipboard: %w", err)
+	if err := clipboard.WriteAll(correctedText); err != nil {
+		log.Printf("❌ Failed to write to clipboard: %v", err)
+		return
 	}
 
-	// Paste the translated text
 	time.Sleep(100 * time.Millisecond)
-	robotgo.KeyTap("v", "ctrl")
+	pasteFromClipboard()
 
-	log.Printf("Translated and pasted: %s", truncate(translated, 50))
-	return nil
+	log.Printf("   Corrected: %s", truncateText(correctedText, 50))
+	log.Println("✅ Text translated and pasted successfully")
+	clipboard.WriteAll("")
 }
 
-func translateText(ctx context.Context, apiKey, text string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+func translateWithGemini(text string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Prepare request
-	reqBody := request{
-		Contents: []content{{
-			Parts: []part{{
-				Text: fmt.Sprintf("Translate the following text to standard English, correcting any grammar or spelling errors. If the text is in Armenian (including Latin transliteration), translate it to English. Reply only with the translation, no comments: %s", text),
-			}},
-		}},
-	}
-
-	jsonData, err := json.Marshal(reqBody)
+	// Create genai client - gets API key from GEMINI_API_KEY env var
+	client, err := genai.NewClient(ctx, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return "", fmt.Errorf("failed to create client: %w", err)
 	}
 
-	// Create and send HTTP request
-	url := fmt.Sprintf(translateEndpoint, modelName) + "?key=" + apiKey
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(jsonData))
+	prompt := fmt.Sprintf(`Translate this text to English and fix any grammar or spelling errors. 
+If the text is already in English, just correct any errors. 
+If it's in Armenian (including transliterated Armenian), translate to English.
+Return only the corrected/translated text without any additional comments or explanations:
+
+%s`, text)
+
+	result, err := client.Models.GenerateContent(
+		ctx,
+		"gemini-2.0-flash",
+		genai.Text(prompt),
+		nil,
+	)
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Read and parse response
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+		return "", fmt.Errorf("generation failed: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("API error (status %d): %s", resp.StatusCode, truncate(string(body), 100))
-	}
-
-	var result response
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	if len(result.Candidates) == 0 || len(result.Candidates[0].Content.Parts) == 0 {
-		return "", fmt.Errorf("no translation result returned")
-	}
-
-	return strings.TrimSpace(result.Candidates[0].Content.Parts[0].Text), nil
+	return strings.TrimSpace(result.Text()), nil
 }
 
-// Helper function to truncate strings for logging
-func truncate(s string, maxLen int) string {
+// copyToClipboard handles OS-specific copy shortcuts
+func copyToClipboard() {
+	if runtime.GOOS == "darwin" {
+		robotgo.KeyTap("c", "cmd") // macOS uses Cmd+C
+	} else {
+		robotgo.KeyTap("c", "ctrl") // Windows/Linux use Ctrl+C
+	}
+}
+
+// pasteFromClipboard handles OS-specific paste shortcuts  
+func pasteFromClipboard() {
+	if runtime.GOOS == "darwin" {
+		robotgo.KeyTap("v", "cmd") // macOS uses Cmd+V
+	} else {
+		robotgo.KeyTap("v", "ctrl") // Windows/Linux use Ctrl+V
+	}
+}
+
+func truncateText(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
