@@ -45,31 +45,44 @@ func main() {
 }
 
 func processSelectedText() {
+	// Save current clipboard content before processing
+	previousClipboard, err := clipboard.ReadAll()
+	if err != nil {
+		log.Printf("⚠️  Failed to read current clipboard: %v", err)
+		// Continue anyway - we'll just not restore it
+		previousClipboard = ""
+	}
+
 	// Copy selected text to clipboard
 	copyToClipboard()
 	time.Sleep(200 * time.Millisecond)
 
-	originalText, err := clipboard.ReadAll()
+	selectedText, err := clipboard.ReadAll()
 	if err != nil {
 		log.Printf("❌ Failed to read clipboard: %v", err)
+		restoreClipboard(previousClipboard)
 		return
 	}
 
-	if strings.TrimSpace(originalText) == "" {
+	if strings.TrimSpace(selectedText) == "" {
 		log.Println("⚠️  No text selected")
+		restoreClipboard(previousClipboard)
 		return
 	}
 
-	log.Printf("   Original: %s", truncateText(originalText, 50))
+	log.Printf("   Original: %s", truncateText(selectedText, 50))
 
-	correctedText, err := translateWithGemini(originalText)
+	correctedText, err := translateWithGemini(selectedText)
 	if err != nil {
 		log.Printf("❌ Translation failed: %v", err)
+		restoreClipboard(previousClipboard)
 		return
 	}
 
+	// Put corrected text in clipboard and paste it
 	if err := clipboard.WriteAll(correctedText); err != nil {
 		log.Printf("❌ Failed to write to clipboard: %v", err)
+		restoreClipboard(previousClipboard)
 		return
 	}
 
@@ -78,7 +91,10 @@ func processSelectedText() {
 
 	log.Printf("   Corrected: %s", truncateText(correctedText, 50))
 	log.Println("✅ Text translated and pasted successfully")
-	clipboard.WriteAll("")
+
+	// Restore original clipboard content after a short delay
+	time.Sleep(100 * time.Millisecond)
+	restoreClipboard(previousClipboard)
 }
 
 func translateWithGemini(text string) (string, error) {
@@ -126,6 +142,15 @@ func pasteFromClipboard() {
 		robotgo.KeyTap("v", "cmd") // macOS uses Cmd+V
 	} else {
 		robotgo.KeyTap("v", "ctrl") // Windows/Linux use Ctrl+V
+	}
+}
+
+// restoreClipboard restores the previous clipboard content
+func restoreClipboard(previousContent string) {
+	if previousContent != "" {
+		if err := clipboard.WriteAll(previousContent); err != nil {
+			log.Printf("⚠️  Failed to restore clipboard: %v", err)
+		}
 	}
 }
 
