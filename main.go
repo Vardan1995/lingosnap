@@ -1,162 +1,298 @@
+// Gemini Translator with Enhanced GUI (Fyne v2)
+
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/widget"
 	"github.com/atotto/clipboard"
 	"github.com/go-vgo/robotgo"
-	"github.com/joho/godotenv"
 	hook "github.com/robotn/gohook"
 	"google.golang.org/genai"
 )
 
+type Prompt struct {
+	Title string `json:"title"`
+	Text  string `json:"text"`
+}
+
+type Config struct {
+	APIKey         string   `json:"api_key"`
+	Model          string   `json:"model"`
+	Hotkey         string   `json:"hotkey"`
+	Prompts        []Prompt `json:"prompts"`
+	SelectedPrompt string   `json:"selected_prompt"`
+}
+
+const defaultPromptTitle = "Default"
+const defaultPromptText = `Translate this text to English and fix any grammar or spelling errors.
+If the text is already in English, just correct any errors.
+If it's in Armenian (including transliterated Armenian), translate to English.
+Return only the corrected/translated text without any additional comments or explanations.`
+
+var hotkeyOptions = []string{"rshift", "ctrl+alt+x", "alt+z", "ctrl+alt+space"}
+
+type TranslatorApp struct {
+	app            fyne.App
+	window         fyne.Window
+	config         Config
+	hotkeyStopChan chan struct{}
+	hotkeyMutex    sync.Mutex
+	selectedIndex  int
+	promptList     *fyne.Container
+}
+
 func main() {
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using environment variables")
+	a := app.NewWithID("com.gemini.translator")
+	w := a.NewWindow("Gemini Translator Settings")
+	tApp := &TranslatorApp{
+		app:            a,
+		window:         w,
+		hotkeyStopChan: make(chan struct{}),
 	}
-	
-	if os.Getenv("GEMINI_API_KEY") == "" {
-		log.Fatal("GEMINI_API_KEY environment variable is required")
+	tApp.loadConfig()
+	w.SetContent(tApp.buildUI())
+	w.Resize(fyne.NewSize(800, 600))
+	go tApp.runHotkeyListener()
+	w.ShowAndRun()
+}
+
+func (t *TranslatorApp) buildUI() fyne.CanvasObject {
+	apiEntry := widget.NewPasswordEntry()
+	apiEntry.SetText(t.config.APIKey)
+	apiEntry.OnChanged = func(s string) {
+		t.config.APIKey = s
+		t.saveConfig()
 	}
 
-	log.Println("✅ Text Translator is running...")
-	log.Println("   Usage: Select text, then press and release Right Shift")
-	log.Println("   The text will be automatically translated and pasted")
-	if runtime.GOOS == "darwin" {
-		log.Println("   Note: On macOS, you may need to grant accessibility permissions")
-	}
-	log.Println("   Press Ctrl+C to exit")
+	modelSelect := widget.NewSelect([]string{"gemini-2.5-flash", "gemini-2.5-pro"}, func(s string) {
+		t.config.Model = s
+		t.saveConfig()
+	})
+	modelSelect.SetSelected(t.config.Model)
 
-	// Register Right Shift key release event
-	hook.Register(hook.KeyUp, []string{"rshift"}, func(e hook.Event) {
-		log.Println("▶ Right Shift detected - processing selected text...")
-		go processSelectedText()
+	hotkeySelect := widget.NewSelect(hotkeyOptions, func(s string) {
+		t.config.Hotkey = s
+		t.saveConfig()
+		t.restartHotkeyListener()
+	})
+	hotkeySelect.SetSelected(t.config.Hotkey)
+
+	t.promptList = container.NewVBox()
+	t.refreshPromptList()
+
+	addBtn := widget.NewButton("Add Prompt", func() {
+		t.showPromptEditor(Prompt{"", ""}, -1)
 	})
 
+	form := container.NewVBox(
+		widget.NewLabel("Gemini API Key"), apiEntry,
+		widget.NewLabel("AI Model"), modelSelect,
+		widget.NewLabel("Hotkey"), hotkeySelect,
+		widget.NewLabelWithStyle("Prompt List", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		t.promptList,
+		container.NewCenter(addBtn),
+	)
+
+	return container.NewVScroll(form)
+}
+
+func (t *TranslatorApp) refreshPromptList() {
+	t.promptList.Objects = nil
+
+	// Default prompt (non-deletable)
+	defaultItem := container.NewHBox(
+		widget.NewLabel(defaultPromptTitle),
+		layout.NewSpacer(),
+		widget.NewButton("View", func() {
+			dialog.NewInformation("Prompt", defaultPromptText, t.window).Show()
+		}),
+	)
+	t.promptList.Add(defaultItem)
+
+	for i, p := range t.config.Prompts {
+		index := i // capture index
+		item := container.NewHBox(
+			widget.NewLabel(p.Title),
+			layout.NewSpacer(),
+			widget.NewButton("Edit", func() {
+				t.showPromptEditor(p, index)
+			}),
+			widget.NewButton("Delete", func() {
+				t.config.Prompts = append(t.config.Prompts[:index], t.config.Prompts[index+1:]...)
+				t.saveConfig()
+				t.refreshPromptList()
+			}),
+		)
+		t.promptList.Add(item)
+	}
+
+	t.window.Content().Refresh()
+}
+
+func (t *TranslatorApp) showPromptEditor(p Prompt, index int) {
+	title := widget.NewEntry()
+	title.SetText(p.Title)
+	body := widget.NewMultiLineEntry()
+	body.SetText(p.Text)
+
+	d := dialog.NewForm("Edit Prompt", "Save", "Cancel",
+		[]*widget.FormItem{
+			widget.NewFormItem("Title", title),
+			widget.NewFormItem("Prompt Text", body),
+		},
+		func(ok bool) {
+			if !ok {
+				return
+			}
+			newPrompt := Prompt{Title: title.Text, Text: body.Text}
+			if newPrompt.Title == "" || newPrompt.Text == "" {
+				dialog.NewInformation("Error", "Title and Prompt Text are required.", t.window).Show()
+				return
+			}
+			if index >= 0 {
+				t.config.Prompts[index] = newPrompt
+			} else {
+				t.config.Prompts = append(t.config.Prompts, newPrompt)
+			}
+			t.saveConfig()
+			t.refreshPromptList()
+		}, t.window)
+	d.Resize(fyne.NewSize(600, 400))
+	d.Show()
+}
+
+func (t *TranslatorApp) configPath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return filepath.Join(dir, "gemini-translator-settings.json")
+}
+
+func (t *TranslatorApp) saveConfig() {
+	data, _ := json.MarshalIndent(t.config, "", "  ")
+	_ = os.WriteFile(t.configPath(), data, 0644)
+}
+
+func (t *TranslatorApp) loadConfig() {
+	f, err := os.ReadFile(t.configPath())
+	if err != nil || len(f) == 0 {
+		t.config = Config{
+			APIKey:         os.Getenv("GEMINI_API_KEY"),
+			Model:          "gemini-2.5-flash",
+			Hotkey:         "rshift",
+			Prompts:        []Prompt{},
+			SelectedPrompt: defaultPromptText,
+		}
+		t.saveConfig()
+		return
+	}
+	_ = json.Unmarshal(f, &t.config)
+}
+
+func (t *TranslatorApp) restartHotkeyListener() {
+	t.hotkeyMutex.Lock()
+	defer t.hotkeyMutex.Unlock()
+	if t.hotkeyStopChan != nil {
+		close(t.hotkeyStopChan)
+	}
+	t.hotkeyStopChan = make(chan struct{})
+	go t.runHotkeyListener()
+}
+
+func (t *TranslatorApp) runHotkeyListener() {
+	t.hotkeyMutex.Lock()
+	hotkey := t.config.Hotkey
+	stop := t.hotkeyStopChan
+	t.hotkeyMutex.Unlock()
+
+	keys := strings.Split(hotkey, "+")
+	hook.Register(hook.KeyUp, keys, func(e hook.Event) {
+		go t.processSelectedText()
+	})
 	s := hook.Start()
-	<-hook.Process(s)
+	select {
+	case <-stop:
+		hook.StopEvent()
+	case <-hook.Process(s):
+	}
 }
 
-func processSelectedText() {
-	// Save current clipboard content before processing
-	previousClipboard, err := clipboard.ReadAll()
-	if err != nil {
-		log.Printf("⚠️  Failed to read current clipboard: %v", err)
-		// Continue anyway - we'll just not restore it
-		previousClipboard = ""
-	}
-
-	// Copy selected text to clipboard
+func (t *TranslatorApp) processSelectedText() {
+	prev, _ := clipboard.ReadAll()
 	copyToClipboard()
-	time.Sleep(200 * time.Millisecond)
-
-	selectedText, err := clipboard.ReadAll()
-	if err != nil {
-		log.Printf("❌ Failed to read clipboard: %v", err)
-		restoreClipboard(previousClipboard)
-		return
-	}
-
-	if strings.TrimSpace(selectedText) == "" {
-		log.Println("⚠️  No text selected")
-		restoreClipboard(previousClipboard)
-		return
-	}
-
-	log.Printf("   Original: %s", truncateText(selectedText, 50))
-
-	correctedText, err := translateWithGemini(selectedText)
-	if err != nil {
-		log.Printf("❌ Translation failed: %v", err)
-		restoreClipboard(previousClipboard)
-		return
-	}
-
-	// Put corrected text in clipboard and paste it
-	if err := clipboard.WriteAll(correctedText); err != nil {
-		log.Printf("❌ Failed to write to clipboard: %v", err)
-		restoreClipboard(previousClipboard)
-		return
-	}
-
 	time.Sleep(100 * time.Millisecond)
-	pasteFromClipboard()
+	text, _ := clipboard.ReadAll()
+	if strings.TrimSpace(text) == "" {
+		restoreClipboard(prev)
+		return
+	}
 
-	log.Printf("   Corrected: %s", truncateText(correctedText, 50))
-	log.Println("✅ Text translated and pasted successfully")
+	promptText := defaultPromptText
+	if t.selectedIndex > 0 && t.selectedIndex-1 < len(t.config.Prompts) {
+		promptText = t.config.Prompts[t.selectedIndex-1].Text
+	}
 
-	// Restore original clipboard content after a short delay
-	time.Sleep(100 * time.Millisecond)
-	restoreClipboard(previousClipboard)
+	txt, err := translateWithGemini(t.config.APIKey, t.config.Model, promptText, text)
+	if err == nil {
+		clipboard.WriteAll(txt)
+		time.Sleep(100 * time.Millisecond)
+		pasteFromClipboard()
+		time.Sleep(100 * time.Millisecond)
+		restoreClipboard(prev)
+	}
 }
 
-func translateWithGemini(text string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+func translateWithGemini(apiKey, model, prompt, text string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	// Create genai client - gets API key from GEMINI_API_KEY env var
-	client, err := genai.NewClient(ctx, nil)
+	client, err := genai.NewClient(ctx, &genai.ClientConfig{APIKey: apiKey})
 	if err != nil {
-		return "", fmt.Errorf("failed to create client: %w", err)
+		return "", err
 	}
 
-	prompt := fmt.Sprintf(`Translate this text to English and fix any grammar or spelling errors. 
-If the text is already in English, just correct any errors. 
-If it's in Armenian (including transliterated Armenian), translate to English.
-Return only the corrected/translated text without any additional comments or explanations:
-
-%s`, text)
-
-	result, err := client.Models.GenerateContent(
-		ctx,
-		"gemini-2.0-flash",
-		genai.Text(prompt),
-		nil,
-	)
+	resp, err := client.Models.GenerateContent(ctx, model, genai.Text(fmt.Sprintf("%s\n\n%s", prompt, text)), nil)
 	if err != nil {
-		return "", fmt.Errorf("generation failed: %w", err)
+		return "", err
 	}
-
-	return strings.TrimSpace(result.Text()), nil
+	return strings.TrimSpace(resp.Text()), nil
 }
 
-// copyToClipboard handles OS-specific copy shortcuts
 func copyToClipboard() {
 	if runtime.GOOS == "darwin" {
-		robotgo.KeyTap("c", "cmd") // macOS uses Cmd+C
+		robotgo.KeyTap("c", "cmd")
 	} else {
-		robotgo.KeyTap("c", "ctrl") // Windows/Linux use Ctrl+C
+		robotgo.KeyTap("c", "ctrl")
 	}
 }
 
-// pasteFromClipboard handles OS-specific paste shortcuts  
 func pasteFromClipboard() {
 	if runtime.GOOS == "darwin" {
-		robotgo.KeyTap("v", "cmd") // macOS uses Cmd+V
+		robotgo.KeyTap("v", "cmd")
 	} else {
-		robotgo.KeyTap("v", "ctrl") // Windows/Linux use Ctrl+V
+		robotgo.KeyTap("v", "ctrl")
 	}
 }
 
-// restoreClipboard restores the previous clipboard content
-func restoreClipboard(previousContent string) {
-	if previousContent != "" {
-		if err := clipboard.WriteAll(previousContent); err != nil {
-			log.Printf("⚠️  Failed to restore clipboard: %v", err)
-		}
+func restoreClipboard(s string) {
+	if s != "" {
+		clipboard.WriteAll(s)
 	}
-}
-
-func truncateText(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
 }
